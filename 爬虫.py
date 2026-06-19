@@ -1,23 +1,35 @@
+import base64
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
+from urllib.parse import quote, urlencode
 
 import requests
 
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+
+    _HAS_CRYPTO = True
+except ImportError:
+    _HAS_CRYPTO = False
+
 BASE_URL = "https://haowallpaper.com"
-LIST_URL = f"{BASE_URL}/homeView"
 FILE_BASE = f"{BASE_URL}/link/common/file"
+API_BASE = f"{BASE_URL}/link"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Referer": LIST_URL,
 }
+
+_AES_KEY = b"68zhehao2O776519"
+_AES_IV = b"aa176b7519e84710"
 
 CONTENT_TYPE_EXT = {
     "image/jpeg": ".jpg",
@@ -26,6 +38,30 @@ CONTENT_TYPE_EXT = {
     "image/gif": ".gif",
     "video/mp4": ".mp4",
 }
+
+# 种类（与站点下拉一致）
+WP_TYPE_OPTIONS = [
+    ("", "全部"),
+    ("1", "静态壁纸"),
+    ("2", "动态壁纸"),
+]
+
+
+class WallpaperSource(Enum):
+    PC = "pc"
+    MOBILE = "mobile"
+
+    @property
+    def label(self):
+        return {"pc": "电脑壁纸", "mobile": "手机壁纸"}[self.value]
+
+    @property
+    def list_path(self):
+        return "/homeView" if self == WallpaperSource.PC else "/mobileView"
+
+    @property
+    def look_prefix(self):
+        return "/homeViewLook" if self == WallpaperSource.PC else "/mobileViewLook"
 
 
 class CrawlLevel(Enum):
@@ -53,6 +89,71 @@ class CrawlLevel(Enum):
 
 
 @dataclass
+class CategoryItem:
+    id: str
+    name: str
+    code: str = ""
+
+
+@dataclass
+class SiteCategories:
+    """站点 getTypeAll 返回的三组筛选项。"""
+
+    types: list[CategoryItem] = field(default_factory=list)  # 分类
+    ratios: list[CategoryItem] = field(default_factory=list)  # 分辨率
+    colors: list[CategoryItem] = field(default_factory=list)  # 色系
+
+
+@dataclass
+class CrawlFilters:
+    source: WallpaperSource = WallpaperSource.PC
+    wp_type: str = ""  # 种类：1 静态 / 2 动态
+    type_id: str = ""  # 分类
+    ratio_id: str = ""  # 分辨率档位
+    ratio_val: str = ""  # 自定义分辨率
+    color_id: str = ""  # 色系
+    lb_name: str = ""  # 标签名（如 动漫、风景）
+    search: str = ""  # 关键词
+
+    def query_params(self) -> dict[str, str]:
+        params: dict[str, str] = {}
+        if self.wp_type:
+            params["wpType"] = self.wp_type
+        if self.type_id:
+            params["typeId"] = self.type_id
+        if self.ratio_id:
+            params["ratioId"] = self.ratio_id
+        if self.ratio_val:
+            params["ratioVal"] = self.ratio_val
+        if self.color_id:
+            params["colorId"] = self.color_id
+        if self.lb_name.strip():
+            params["lbName"] = self.lb_name.strip()
+        if self.search.strip():
+            params["search"] = self.search.strip()
+        return params
+
+    def summary(self) -> str:
+        parts = [self.source.label]
+        wp_names = dict(WP_TYPE_OPTIONS)
+        if self.wp_type:
+            parts.append(wp_names.get(self.wp_type, self.wp_type))
+        if self.type_id:
+            parts.append(f"分类已选")
+        if self.ratio_id or self.ratio_val:
+            parts.append(f"分辨率={self.ratio_id or self.ratio_val}")
+        if self.color_id:
+            parts.append("色系已选")
+        if self.lb_name.strip():
+            parts.append(f"标签={self.lb_name.strip()}")
+        if self.search.strip():
+            parts.append(f"搜索={self.search.strip()}")
+        if len(parts) == 1:
+            parts.append("全部")
+        return " · ".join(parts)
+
+
+@dataclass
 class CrawlConfig:
     level: CrawlLevel = CrawlLevel.STANDARD
     start_page: int = 1
@@ -60,29 +161,92 @@ class CrawlConfig:
     save_dir: str = "wallpapers"
     request_delay: float = 0.5
     skip_existing: bool = True
+    filters: CrawlFilters = field(default_factory=CrawlFilters)
 
 
 LogCallback = Callable[[str], None]
 StopCheck = Callable[[], bool]
 
 
-def fetch_html(url):
-    response = requests.get(url, headers=HEADERS, timeout=30)
+def _headers_for(source: WallpaperSource) -> dict[str, str]:
+    h = dict(HEADERS)
+    h["Referer"] = BASE_URL + source.list_path
+    return h
+
+
+def decrypt_api_data(raw: str) -> str:
+    if not _HAS_CRYPTO:
+        raise RuntimeError("缺少 pycryptodome，请执行: pip install pycryptodome")
+    ct = base64.b64decode(raw)
+    plain = unpad(AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV).decrypt(ct), AES.block_size)
+    return plain.decode("utf-8", errors="ignore").split("\x00", 1)[0]
+
+
+def fetch_categories(log: LogCallback = print) -> SiteCategories:
+    """从 /pc/wallpaper/getTypeAll 拉取站点分类、分辨率、色系。"""
+    url = f"{API_BASE}/pc/wallpaper/getTypeAll"
+    log("正在获取站点分类…")
+    response = requests.get(url, headers=_headers_for(WallpaperSource.PC), timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("status") != 200:
+        raise RuntimeError(payload.get("msg") or "获取分类失败")
+
+    import json
+
+    data = json.loads(decrypt_api_data(payload["data"]))
+
+    def to_items(key: str) -> list[CategoryItem]:
+        return [
+            CategoryItem(
+                id=str(item.get("id", "")),
+                name=str(item.get("typeName", "")),
+                code=str(item.get("typeCode", "")),
+            )
+            for item in data.get(key, [])
+            if item.get("id") and item.get("typeName")
+        ]
+
+    cats = SiteCategories(
+        types=to_items("1"),
+        ratios=to_items("2"),
+        colors=to_items("3"),
+    )
+    log(
+        f"分类 {len(cats.types)} 项，分辨率 {len(cats.ratios)} 项，色系 {len(cats.colors)} 项"
+    )
+    return cats
+
+
+def build_list_url(source: WallpaperSource, page: int, filters: CrawlFilters) -> str:
+    path = source.list_path
+    params = filters.query_params()
+    if page > 1:
+        params["page"] = str(page)
+    if not params:
+        return f"{BASE_URL}{path}"
+    return f"{BASE_URL}{path}?{urlencode(params, quote_via=quote)}"
+
+
+def fetch_html(url, source: WallpaperSource = WallpaperSource.PC):
+    response = requests.get(url, headers=_headers_for(source), timeout=30)
     response.raise_for_status()
     response.encoding = response.apparent_encoding or "utf-8"
     return response.text
 
 
-def parse_list_page(html):
-    return list(dict.fromkeys(re.findall(r"/homeViewLook/([\w]+)", html)))
+def parse_list_page(html, source: WallpaperSource = WallpaperSource.PC):
+    prefix = re.escape(source.look_prefix)
+    return list(dict.fromkeys(re.findall(rf"{prefix}/([\w]+)", html)))
 
 
-def parse_list_page_items(html):
+def parse_list_page_items(html, source: WallpaperSource = WallpaperSource.PC):
     """从列表页解析壁纸 ID、缩略图文件 ID 与标题。"""
     items = []
-    for wallpaper_id in parse_list_page(html):
+    look = source.look_prefix
+    for wallpaper_id in parse_list_page(html, source):
         pattern = (
-            rf"/homeViewLook/{wallpaper_id}[\s\S]{{0,2500}}?"
+            rf"{re.escape(look)}/{wallpaper_id}[\s\S]{{0,2500}}?"
             r"(getCroppingImg|getVideoReduce)/([\w]+)"
         )
         match = re.search(pattern, html)
@@ -131,10 +295,13 @@ def download_file(
     skip_video=False,
     skip_existing=True,
     log=print,
+    source: WallpaperSource = WallpaperSource.PC,
 ):
     url = f"{FILE_BASE}/{endpoint}/{file_id}"
     try:
-        response = requests.get(url, headers=HEADERS, stream=True, timeout=60)
+        response = requests.get(
+            url, headers=_headers_for(source), stream=True, timeout=60
+        )
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
@@ -164,11 +331,16 @@ def download_file(
         return False
 
 
-def collect_items_fast(page_num, log=print, should_stop: StopCheck | None = None):
-    page_url = LIST_URL if page_num == 1 else f"{LIST_URL}?page={page_num}"
+def collect_items_fast(
+    page_num,
+    filters: CrawlFilters,
+    log=print,
+    should_stop: StopCheck | None = None,
+):
+    page_url = build_list_url(filters.source, page_num, filters)
     log(f"正在解析列表第 {page_num} 页: {page_url}")
-    html = fetch_html(page_url)
-    items = parse_list_page_items(html)
+    html = fetch_html(page_url, filters.source)
+    items = parse_list_page_items(html, filters.source)
     log(f"  找到 {len(items)} 条（缩略图模式）")
     return [
         {
@@ -181,20 +353,26 @@ def collect_items_fast(page_num, log=print, should_stop: StopCheck | None = None
     ]
 
 
-def collect_items_detail(page_num, log=print, should_stop: StopCheck | None = None):
-    page_url = LIST_URL if page_num == 1 else f"{LIST_URL}?page={page_num}"
+def collect_items_detail(
+    page_num,
+    filters: CrawlFilters,
+    log=print,
+    should_stop: StopCheck | None = None,
+):
+    page_url = build_list_url(filters.source, page_num, filters)
     log(f"正在爬取列表第 {page_num} 页: {page_url}")
-    html = fetch_html(page_url)
-    wallpaper_ids = parse_list_page(html)
+    html = fetch_html(page_url, filters.source)
+    wallpaper_ids = parse_list_page(html, filters.source)
     log(f"  找到 {len(wallpaper_ids)} 个条目，正在访问详情页…")
 
+    look = filters.source.look_prefix
     results = []
     for idx, wallpaper_id in enumerate(wallpaper_ids, 1):
         if should_stop and should_stop():
             break
-        detail_url = f"{BASE_URL}/homeViewLook/{wallpaper_id}"
+        detail_url = f"{BASE_URL}{look}/{wallpaper_id}"
         try:
-            detail_html = fetch_html(detail_url)
+            detail_html = fetch_html(detail_url, filters.source)
             file_id, title = parse_detail_page(detail_html)
             if not file_id:
                 log(f"  [{idx}] 未找到预览资源: {wallpaper_id}")
@@ -219,8 +397,9 @@ def run_crawl(
     os.makedirs(config.save_dir, exist_ok=True)
     skip_video = config.level != CrawlLevel.FULL
     use_fast = config.level == CrawlLevel.FAST
-    collect_fn = collect_items_fast if use_fast else collect_items_detail
+    filters = config.filters
 
+    log(f"数据源: {filters.summary()}")
     log(f"爬取程度: {config.level.label}")
     log(f"页码范围: {config.start_page} — {config.end_page}")
     log(f"保存目录: {os.path.abspath(config.save_dir)}")
@@ -237,8 +416,9 @@ def run_crawl(
             log("用户已停止爬取。")
             break
 
+        collect_fn = collect_items_fast if use_fast else collect_items_detail
         try:
-            items = collect_fn(page, log=log, should_stop=should_stop)
+            items = collect_fn(page, filters, log=log, should_stop=should_stop)
         except Exception as e:
             log(f"列表第 {page} 页失败: {e}")
             continue
@@ -267,6 +447,7 @@ def run_crawl(
                 skip_video=skip_video,
                 skip_existing=config.skip_existing,
                 log=log,
+                source=filters.source,
             ):
                 downloaded += 1
 

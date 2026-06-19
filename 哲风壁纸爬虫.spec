@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['爬虫', '爬虫_gui']
+hiddenimports = ['爬虫', '爬虫_gui', 'Crypto', 'Crypto.Cipher', 'Crypto.Util.Padding']
 tmp_ret = collect_all('requests')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

@@ -3,18 +3,11 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 echo 安装打包依赖...
-pip install -q pyinstaller requests
+pip install -q pyinstaller requests pycryptodome
 
 echo.
 echo 开始打包...
-pyinstaller --noconfirm --clean ^
-  --onefile ^
-  --windowed ^
-  --name "哲风壁纸爬虫" ^
-  --hidden-import=爬虫 ^
-  --hidden-import=爬虫_gui ^
-  --collect-all=requests ^
-  main.py
+pyinstaller --noconfirm --clean 哲风壁纸爬虫.spec
 
 if %ERRORLEVEL% equ 0 (
     echo.
